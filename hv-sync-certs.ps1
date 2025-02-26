@@ -17,16 +17,23 @@
     If specified, the script will only check and report which certificates are missing on which hosts,
     without performing any synchronization.
 
+.PARAMETER ReplaceExpiring
+    If specified, the script will replace certificates with newer versions that have the same subject
+    but a more recent expiry date.
+
 .EXAMPLE
     .\hv-sync-certs.ps1 -ClusterName "HVCluster01"
 
 .EXAMPLE
     .\hv-sync-certs.ps1 -ClusterName "HVCluster01" -Verify
 
+.EXAMPLE
+    .\hv-sync-certs.ps1 -ClusterName "HVCluster01" -ReplaceExpiring
+
 .NOTES
     Author: Script Generator
     Requires: PowerShell 5.1 or later, Failover Clustering and Hyper-V modules
-    Version: 1.1
+    Version: 1.2
 #>
 
 param (
@@ -34,7 +41,10 @@ param (
     [string]$ClusterName,
     
     [Parameter(Mandatory=$false)]
-    [switch]$Verify
+    [switch]$Verify,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$ReplaceExpiring
 )
 
 # Function to check if a host is online
@@ -57,7 +67,24 @@ function Get-ShieldedVMCertificates {
     
     try {
         $certs = Invoke-Command -ComputerName $HostName -ScriptBlock {
-            Get-Item -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\*" -ErrorAction SilentlyContinue
+            $certificates = Get-Item -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\*" -ErrorAction SilentlyContinue
+            
+            # Convert certificates to a format that can be serialized across the remoting boundary
+            $certDetails = @()
+            foreach ($cert in $certificates) {
+                $certDetails += @{
+                    Thumbprint = $cert.Thumbprint
+                    Subject = $cert.Subject
+                    Issuer = $cert.Issuer
+                    NotBefore = $cert.NotBefore
+                    NotAfter = $cert.NotAfter
+                    SerialNumber = $cert.SerialNumber
+                    HasPrivateKey = $cert.HasPrivateKey
+                    Certificate = $cert
+                }
+            }
+            
+            return $certDetails
         } -ErrorAction Stop
         
         return $certs
@@ -96,32 +123,106 @@ function Import-CertificateToHost {
         [string]$HostName,
         
         [Parameter(Mandatory=$true)]
-        [string]$CertificatePath
+        [string]$CertificatePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Thumbprint,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$ReplaceExpiring
     )
     
     try {
         $result = Invoke-Command -ComputerName $HostName -ScriptBlock {
-            param($CertPath)
+            param($CertPath, $CertThumbprint, $ShouldReplaceExpiring)
             
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-            $cert.Import($CertPath)
+            # Import the new certificate first to examine its properties
+            $newCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+            $newCert.Import($CertPath)
             
+            # Verify the thumbprint matches what we expect
+            if ($newCert.Thumbprint -ne $CertThumbprint) {
+                Write-Warning "Certificate thumbprint mismatch. Expected: $CertThumbprint, Actual: $($newCert.Thumbprint)"
+                return @{
+                    Success = $false
+                    Status = "ThumbprintMismatch"
+                }
+            }
+            
+            # Check if certificate already exists
+            $existingCert = Get-Item -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\$CertThumbprint" -ErrorAction SilentlyContinue
+            
+            if ($existingCert) {
+                Write-Host "Certificate with thumbprint $CertThumbprint already exists on this host." -ForegroundColor Yellow
+                # Certificate already exists, no need to import
+                return @{
+                    Success = $true
+                    Status = "AlreadyExists"
+                }
+            }
+            
+            # If we're replacing expiring certificates, check for certificates with the same subject
+            if ($ShouldReplaceExpiring) {
+                $subjectCerts = Get-ChildItem -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\" | 
+                                Where-Object { $_.Subject -eq $newCert.Subject }
+                
+                if ($subjectCerts) {
+                    $replacedCerts = @()
+                    
+                    foreach ($existingCert in $subjectCerts) {
+                        # If the new certificate expires later than the existing one, replace it
+                        if ($newCert.NotAfter -gt $existingCert.NotAfter) {
+                            Write-Host "Found certificate with same subject but earlier expiry date: $($existingCert.Thumbprint), expires: $($existingCert.NotAfter)" -ForegroundColor Yellow
+                            Write-Host "New certificate expires: $($newCert.NotAfter)" -ForegroundColor Yellow
+                            
+                            # Store the thumbprint for reporting
+                            $replacedCerts += @{
+                                Thumbprint = $existingCert.Thumbprint
+                                ExpiryDate = $existingCert.NotAfter
+                            }
+                        }
+                    }
+                    
+                    if ($replacedCerts.Count -gt 0) {
+                        # We found certificates to replace, proceed with import
+                        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("ShieldedVMLocalCertificates", "LocalMachine")
+                        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                        $store.Add($newCert)
+                        $store.Close()
+                        
+                        return @{
+                            Success = $true
+                            Status = "ReplacedExpiring"
+                            ReplacedCertificates = $replacedCerts
+                        }
+                    }
+                }
+            }
+            
+            # Standard import case - no existing certificate with same thumbprint or subject to replace
             $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("ShieldedVMLocalCertificates", "LocalMachine")
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            $store.Add($cert)
+            $store.Add($newCert)
             $store.Close()
             
             # Clean up the temporary file
             Remove-Item -Path $CertPath -Force
             
-            return $true
-        } -ArgumentList $CertificatePath -ErrorAction Stop
+            return @{
+                Success = $true
+                Status = "Imported"
+            }
+        } -ArgumentList $CertificatePath, $Thumbprint, $ReplaceExpiring -ErrorAction Stop
         
         return $result
     }
     catch {
         Write-Warning "Failed to import certificate to $HostName. Error: $_"
-        return $false
+        return @{
+            Success = $false
+            Status = "Error"
+            ErrorMessage = $_
+        }
     }
 }
 
@@ -131,6 +232,10 @@ Write-Host "============================================" -ForegroundColor Cyan
 
 if ($Verify) {
     Write-Host "Running in VERIFY mode - certificates will be checked but NOT synchronized" -ForegroundColor Yellow
+}
+
+if ($ReplaceExpiring) {
+    Write-Host "Running with REPLACE EXPIRING mode - certificates with newer expiry dates will replace older ones" -ForegroundColor Yellow
 }
 
 # Prompt for cluster name if not provided
@@ -276,7 +381,7 @@ try {
                 
                 # Export certificate to a file
                 $certFile = Join-Path -Path $tempDir -ChildPath "$thumbprint.cer"
-                $exportResult = Export-CertificateToFile -Certificate $cert -FilePath $certFile
+                $exportResult = Export-CertificateToFile -Certificate $cert.Certificate -FilePath $certFile
                 
                 if ($exportResult) {
                     # Copy the certificate file to the target host
@@ -284,13 +389,30 @@ try {
                     Copy-Item -Path $certFile -Destination $targetCertPath -Force
                     
                     # Import the certificate on the target host
-                    $importResult = Import-CertificateToHost -HostName $targetHost -CertificatePath "C:\Windows\Temp\$thumbprint.cer"
+                    $importResult = Import-CertificateToHost -HostName $targetHost -CertificatePath "C:\Windows\Temp\$thumbprint.cer" -Thumbprint $thumbprint -ReplaceExpiring:$ReplaceExpiring
                     
-                    if ($importResult) {
-                        Write-Host "Successfully synchronized certificate $thumbprint to '$targetHost'." -ForegroundColor Green
+                    if ($importResult.Success) {
+                        switch ($importResult.Status) {
+                            "AlreadyExists" {
+                                Write-Host "Certificate $thumbprint already exists on '$targetHost'. No changes made." -ForegroundColor Yellow
+                            }
+                            "ReplacedExpiring" {
+                                Write-Host "Successfully imported certificate $thumbprint to '$targetHost', replacing older certificates with same subject." -ForegroundColor Green
+                                foreach ($replaced in $importResult.ReplacedCertificates) {
+                                    Write-Host "  - Replaced certificate: $($replaced.Thumbprint) (expired: $($replaced.ExpiryDate))" -ForegroundColor Yellow
+                                }
+                            }
+                            default {
+                                Write-Host "Successfully synchronized certificate $thumbprint to '$targetHost'." -ForegroundColor Green
+                            }
+                        }
                     }
                     else {
-                        Write-Host "Failed to import certificate $thumbprint to '$targetHost'." -ForegroundColor Red
+                        if ($importResult.Status -eq "ThumbprintMismatch") {
+                            Write-Host "Failed to import certificate to '$targetHost'. Thumbprint mismatch detected." -ForegroundColor Red
+                        } else {
+                            Write-Host "Failed to import certificate $thumbprint to '$targetHost'. Error: $($importResult.ErrorMessage)" -ForegroundColor Red
+                        }
                     }
                     
                     # Clean up the local certificate file
@@ -320,7 +442,12 @@ try {
         Write-Host "Mode: VERIFY (no synchronization performed)" -ForegroundColor Yellow
     }
     else {
-        Write-Host "Mode: SYNCHRONIZE" -ForegroundColor Green
+        if ($ReplaceExpiring) {
+            Write-Host "Mode: SYNCHRONIZE WITH CERTIFICATE RENEWAL" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Mode: SYNCHRONIZE" -ForegroundColor Green
+        }
     }
     
     if ($offlineHosts.Count -gt 0) {
