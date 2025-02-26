@@ -58,6 +58,93 @@ function Test-HostOnline {
     return $pingResult
 }
 
+# Function to check if the Shielded VM certificate store exists and create it if needed
+function Test-ShieldedVMCertStore {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$HostName
+    )
+    
+    try {
+        $result = Invoke-Command -ComputerName $HostName -ScriptBlock {
+            # Check if the certificate store exists
+            $storePath = "Cert:\LocalMachine\Shielded VM Local Certificates"
+            $storeExists = Test-Path -Path $storePath
+            
+            if (-not $storeExists) {
+                Write-Host "Shielded VM Local Certificates store does not exist on this host." -ForegroundColor Yellow
+                
+                # Check if the Shielded VM feature is installed
+                $featureInstalled = Get-WindowsFeature -Name HostGuardian -ErrorAction SilentlyContinue
+                
+                if (-not $featureInstalled -or -not $featureInstalled.Installed) {
+                    Write-Host "The Host Guardian Service feature is not installed on this host." -ForegroundColor Red
+                    Write-Host "This feature is required for Shielded VMs and the associated certificate store." -ForegroundColor Red
+                    
+                    return @{
+                        Success = $false
+                        Status = "FeatureNotInstalled"
+                        Message = "The Host Guardian Service feature is not installed on this host."
+                    }
+                }
+                
+                # Try to create the certificate store
+                try {
+                    # Create a new X509 store with the correct name including spaces
+                    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Shielded VM Local Certificates", "LocalMachine")
+                    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    $store.Close()
+                    
+                    # Verify the store was created
+                    $storeExists = Test-Path -Path $storePath
+                    
+                    if ($storeExists) {
+                        Write-Host "Successfully created Shielded VM Local Certificates store." -ForegroundColor Green
+                        return @{
+                            Success = $true
+                            Status = "StoreCreated"
+                        }
+                    }
+                    else {
+                        Write-Host "Failed to create Shielded VM Local Certificates store." -ForegroundColor Red
+                        return @{
+                            Success = $false
+                            Status = "CreateFailed"
+                            Message = "Failed to create the certificate store even though the feature appears to be installed."
+                        }
+                    }
+                }
+                catch {
+                    $errorMessage = $_.ToString()
+                    Write-Host "Error creating Shielded VM Local Certificates store: $errorMessage" -ForegroundColor Red
+                    return @{
+                        Success = $false
+                        Status = "CreateError"
+                        Message = "Error creating certificate store: $errorMessage"
+                    }
+                }
+            }
+            
+            # Store exists
+            return @{
+                Success = $true
+                Status = "StoreExists"
+            }
+        } -ErrorAction Stop
+        
+        return $result
+    }
+    catch {
+        $errorMessage = $_.ToString()
+        Write-Warning "Failed to check/create certificate store on $HostName. Error: $errorMessage"
+        return @{
+            Success = $false
+            Status = "ConnectionError"
+            Message = "Failed to connect to host: $errorMessage"
+        }
+    }
+}
+
 # Function to get certificates from a host
 function Get-ShieldedVMCertificates {
     param (
@@ -65,9 +152,18 @@ function Get-ShieldedVMCertificates {
         [string]$HostName
     )
     
+    # First check if the certificate store exists
+    $storeCheck = Test-ShieldedVMCertStore -HostName $HostName
+    
+    if (-not $storeCheck.Success) {
+        $errorMsg = $storeCheck.Message
+        Write-Warning "Cannot get certificates from $HostName`: $errorMsg"
+        return $null
+    }
+    
     try {
         $certs = Invoke-Command -ComputerName $HostName -ScriptBlock {
-            $certificates = Get-Item -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\*" -ErrorAction SilentlyContinue
+            $certificates = Get-Item -Path "Cert:\LocalMachine\Shielded VM Local Certificates\*" -ErrorAction SilentlyContinue
             
             # Convert certificates to a format that can be serialized across the remoting boundary
             $certDetails = @()
@@ -90,7 +186,8 @@ function Get-ShieldedVMCertificates {
         return $certs
     }
     catch {
-        Write-Warning "Failed to get certificates from $HostName. Error: $_"
+        $errorMessage = $_.ToString()
+        Write-Warning "Failed to get certificates from $HostName. Error: $errorMessage"
         return $null
     }
 }
@@ -111,7 +208,8 @@ function Export-CertificateToFile {
         return $true
     }
     catch {
-        Write-Warning "Failed to export certificate to $FilePath. Error: $_"
+        $errorMessage = $_.ToString()
+        Write-Warning "Failed to export certificate to $FilePath. Error: $errorMessage"
         return $false
     }
 }
@@ -132,6 +230,19 @@ function Import-CertificateToHost {
         [switch]$ReplaceExpiring
     )
     
+    # First check if the certificate store exists
+    $storeCheck = Test-ShieldedVMCertStore -HostName $HostName
+    
+    if (-not $storeCheck.Success) {
+        $errorMsg = $storeCheck.Message
+        Write-Warning "Cannot import certificate to $HostName`: $errorMsg"
+        return @{
+            Success = $false
+            Status = "StoreNotAvailable"
+            ErrorMessage = $errorMsg
+        }
+    }
+    
     try {
         $result = Invoke-Command -ComputerName $HostName -ScriptBlock {
             param($CertPath, $CertThumbprint, $ShouldReplaceExpiring)
@@ -150,7 +261,7 @@ function Import-CertificateToHost {
             }
             
             # Check if certificate already exists
-            $existingCert = Get-Item -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\$CertThumbprint" -ErrorAction SilentlyContinue
+            $existingCert = Get-Item -Path "Cert:\LocalMachine\Shielded VM Local Certificates\$CertThumbprint" -ErrorAction SilentlyContinue
             
             if ($existingCert) {
                 Write-Host "Certificate with thumbprint $CertThumbprint already exists on this host." -ForegroundColor Yellow
@@ -163,7 +274,7 @@ function Import-CertificateToHost {
             
             # If we're replacing expiring certificates, check for certificates with the same subject
             if ($ShouldReplaceExpiring) {
-                $subjectCerts = Get-ChildItem -Path "Cert:\LocalMachine\ShieldedVMLocalCertificates\" | 
+                $subjectCerts = Get-ChildItem -Path "Cert:\LocalMachine\Shielded VM Local Certificates\" | 
                                 Where-Object { $_.Subject -eq $newCert.Subject }
                 
                 if ($subjectCerts) {
@@ -185,7 +296,7 @@ function Import-CertificateToHost {
                     
                     if ($replacedCerts.Count -gt 0) {
                         # We found certificates to replace, proceed with import
-                        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("ShieldedVMLocalCertificates", "LocalMachine")
+                        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Shielded VM Local Certificates", "LocalMachine")
                         $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
                         $store.Add($newCert)
                         $store.Close()
@@ -200,7 +311,7 @@ function Import-CertificateToHost {
             }
             
             # Standard import case - no existing certificate with same thumbprint or subject to replace
-            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("ShieldedVMLocalCertificates", "LocalMachine")
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Shielded VM Local Certificates", "LocalMachine")
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
             $store.Add($newCert)
             $store.Close()
@@ -217,11 +328,12 @@ function Import-CertificateToHost {
         return $result
     }
     catch {
-        Write-Warning "Failed to import certificate to $HostName. Error: $_"
+        $errorMessage = $_.ToString()
+        Write-Warning "Failed to import certificate to $HostName. Error: $errorMessage"
         return @{
             Success = $false
             Status = "Error"
-            ErrorMessage = $_
+            ErrorMessage = $errorMessage
         }
     }
 }
@@ -260,9 +372,10 @@ catch {
     exit 1
 }
 
-# Check which hosts are online
+# Check which hosts are online and have the required certificate store
 $onlineHosts = @()
 $offlineHosts = @()
+$incompatibleHosts = @()
 
 foreach ($node in $clusterNodes) {
     $nodeName = $node.Name
@@ -270,7 +383,23 @@ foreach ($node in $clusterNodes) {
     
     if (Test-HostOnline -HostName $nodeName) {
         Write-Host "Host '$nodeName' is online." -ForegroundColor Green
-        $onlineHosts += $nodeName
+        
+        # Check if the host has the Shielded VM certificate store
+        Write-Host "Checking if host '$nodeName' has the Shielded VM certificate store..." -ForegroundColor Yellow
+        $storeCheck = Test-ShieldedVMCertStore -HostName $nodeName
+        
+        if ($storeCheck.Success) {
+            Write-Host "Host '$nodeName' has the Shielded VM certificate store." -ForegroundColor Green
+            $onlineHosts += $nodeName
+        }
+        else {
+            Write-Host "Host '$nodeName' does not have the Shielded VM certificate store and cannot be used." -ForegroundColor Red
+            Write-Host "  Reason: $($storeCheck.Message)" -ForegroundColor Red
+            $incompatibleHosts += @{
+                Name = $nodeName
+                Reason = $storeCheck.Message
+            }
+        }
     }
     else {
         Write-Host "Host '$nodeName' is offline." -ForegroundColor Red
@@ -279,7 +408,7 @@ foreach ($node in $clusterNodes) {
 }
 
 if ($onlineHosts.Count -eq 0) {
-    Write-Host "No online hosts found. Exiting." -ForegroundColor Red
+    Write-Host "No compatible online hosts found. Exiting." -ForegroundColor Red
     exit 1
 }
 
@@ -333,9 +462,17 @@ try {
         
         foreach ($thumbprint in $allCertificates.Keys) {
             if ($hostThumbprints -notcontains $thumbprint) {
+                $sourceHost = $allCertificates[$thumbprint].SourceHost
+                
+                # Skip if the source host is the same as the target host (prevent self-importing)
+                if ($sourceHost -eq $hostName) {
+                    Write-Host "Warning: Certificate $thumbprint appears to be from host '$hostName' but wasn't detected in the initial scan. Skipping self-import." -ForegroundColor Yellow
+                    continue
+                }
+                
                 $syncOperations += @{
                     TargetHost = $hostName
-                    SourceHost = $allCertificates[$thumbprint].SourceHost
+                    SourceHost = $sourceHost
                     Certificate = $allCertificates[$thumbprint].Certificate
                     Thumbprint = $thumbprint
                 }
@@ -433,8 +570,11 @@ try {
     Write-Host "`nSynchronization Summary:" -ForegroundColor Cyan
     Write-Host "======================" -ForegroundColor Cyan
     Write-Host "Total hosts in cluster: $($clusterNodes.Count)" -ForegroundColor White
-    Write-Host "Online hosts: $($onlineHosts.Count)" -ForegroundColor Green
+    Write-Host "Online hosts with Shielded VM support: $($onlineHosts.Count)" -ForegroundColor Green
     Write-Host "Offline hosts: $($offlineHosts.Count)" -ForegroundColor Red
+    if ($incompatibleHosts.Count -gt 0) {
+        Write-Host "Incompatible hosts: $($incompatibleHosts.Count)" -ForegroundColor Red
+    }
     Write-Host "Total unique certificates: $($allCertificates.Count)" -ForegroundColor White
     Write-Host "Certificates that need synchronization: $($syncOperations.Count)" -ForegroundColor Yellow
     
@@ -457,6 +597,15 @@ try {
         }
         Write-Host "Please run this script again when these hosts are online." -ForegroundColor Yellow
     }
+
+    if ($incompatibleHosts.Count -gt 0) {
+        Write-Host "`nWarning: The following hosts do not have Shielded VM support configured:" -ForegroundColor Yellow
+        foreach ($host in $incompatibleHosts) {
+            Write-Host "  - $($host.Name): $($host.Reason)" -ForegroundColor Red
+        }
+        Write-Host "These hosts were excluded from certificate synchronization." -ForegroundColor Yellow
+        Write-Host "To include these hosts, ensure the Host Guardian Service feature is installed and configured." -ForegroundColor Yellow
+    }
 }
 finally {
     # Clean up
@@ -466,3 +615,5 @@ finally {
 }
 
 Write-Host "`nScript completed." -ForegroundColor Cyan
+
+
